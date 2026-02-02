@@ -8,6 +8,98 @@ use crate::bindings::exports::betty_blocks::auth::jwt::{AuthError, AuthHeaders, 
 
 struct Component;
 
+/// Extracts the Bearer token from the Authorization header
+fn extract_token(headers: &AuthHeaders) -> Result<&str, AuthError> {
+    let auth_header = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        .ok_or(AuthError::MissingHeader)?;
+
+    auth_header
+        .1
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "null")
+        .ok_or(AuthError::InvalidFormat)
+}
+
+fn validate_rs256(headers: AuthHeaders) -> Result<Claims, AuthError> {
+    use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+
+    let token = extract_token(&headers)?;
+
+    let header = decode_header(token).map_err(|_| AuthError::MalformedToken)?;
+
+    if header.alg != Algorithm::RS256 {
+        return Err(AuthError::UnsupportedAlgorithm(format!(
+            "Expected RS256 algorithm, got: {:?}",
+            header.alg
+        )));
+    }
+
+    let public_key_pem = std::env::var("JWT_PUBLIC_KEY")
+        .map_err(|_| AuthError::MissingConfig("JWT_PUBLIC_KEY".to_string()))?;
+
+    let issuer = std::env::var("JWT_ISSUER")
+        .map_err(|_| AuthError::MissingConfig("JWT_ISSUER".to_string()))?;
+
+    let audience = std::env::var("JWT_AUDIENCE")
+        .map_err(|_| AuthError::MissingConfig("JWT_AUDIENCE".to_string()))?;
+
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]);
+    validation.leeway = 60;
+
+    let decoding_key = DecodingKey::from_rsa_pem(public_key_pem.as_bytes())
+        .map_err(|e| AuthError::InvalidPublicKey(format!("Invalid JWT public key: {}", e)))?;
+
+    let token_data = decode::<JwtClaims>(token, &decoding_key, &validation)
+        .map_err(|e| AuthError::ValidationFailed(format!("JWT validation failed: {}", e)))?;
+
+    Ok(token_data.claims.into())
+}
+
+fn validate_hs512(headers: AuthHeaders) -> Result<Claims, AuthError> {
+    use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+
+    let token = extract_token(&headers)?;
+
+    let header = decode_header(token).map_err(|_| AuthError::MalformedToken)?;
+
+    if header.alg != Algorithm::HS512 {
+        return Err(AuthError::UnsupportedAlgorithm(format!(
+            "Expected HS512 algorithm, got: {:?}",
+            header.alg
+        )));
+    }
+
+    let secret = std::env::var("JWT_SECRET")
+        .map_err(|_| AuthError::MissingConfig("JWT_SECRET".to_string()))?;
+
+    let issuer = std::env::var("JWT_ISSUER")
+        .map_err(|_| AuthError::MissingConfig("JWT_ISSUER".to_string()))?;
+
+    let audience = std::env::var("JWT_AUDIENCE")
+        .map_err(|_| AuthError::MissingConfig("JWT_AUDIENCE".to_string()))?;
+
+    let mut validation = Validation::new(Algorithm::HS512);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]);
+    validation.leeway = 60;
+
+    let decoding_key = DecodingKey::from_secret(secret.as_bytes());
+
+    let token_data = decode::<JwtClaims>(token, &decoding_key, &validation)
+        .map_err(|e| AuthError::ValidationFailed(format!("JWT validation failed: {}", e)))?;
+
+    Ok(token_data.claims.into())
+}
+
 // Helper struct for bridging wit to native rust type
 #[derive(Debug, Serialize, Deserialize)]
 struct JwtClaims {
@@ -46,53 +138,19 @@ impl From<JwtClaims> for Claims {
 
 impl Guest for Component {
     fn validate_token(headers: AuthHeaders) -> Result<Claims, AuthError> {
-        use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+        use jsonwebtoken::{decode_header, Algorithm};
 
-        let auth_header = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-            .ok_or(AuthError::MissingHeader)?;
-
-        let token = auth_header
-            .1
-            .strip_prefix("Bearer ")
-            .map(str::trim)
-            .filter(|t| !t.is_empty() && *t != "null")
-            .ok_or(AuthError::InvalidFormat)?;
-
+        let token = extract_token(&headers)?;
         let header = decode_header(token).map_err(|_| AuthError::MalformedToken)?;
 
-        if header.alg != Algorithm::RS256 {
-            return Err(AuthError::UnsupportedAlgorithm(format!(
-                "Unsupported JWT algorithm: {:?}. Only RS256 is allowed",
-                header.alg
-            )));
+        match header.alg {
+            Algorithm::RS256 => validate_rs256(headers),
+            Algorithm::HS512 => validate_hs512(headers),
+            alg => Err(AuthError::UnsupportedAlgorithm(format!(
+                "Unsupported algorithm: {:?}. Only RS256 and HS512 are supported",
+                alg
+            ))),
         }
-
-        let public_key_pem = std::env::var("JWT_PUBLIC_KEY")
-            .map_err(|_| AuthError::MissingConfig("JWT_PUBLIC_KEY".to_string()))?;
-
-        let issuer = std::env::var("JWT_ISSUER")
-            .map_err(|_| AuthError::MissingConfig("JWT_ISSUER".to_string()))?;
-
-        let audience = std::env::var("JWT_AUDIENCE")
-            .map_err(|_| AuthError::MissingConfig("JWT_AUDIENCE".to_string()))?;
-
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.validate_exp = true;
-        validation.validate_nbf = true;
-        validation.set_issuer(&[issuer]);
-        validation.set_audience(&[audience]);
-        validation.leeway = 60;
-
-        let decoding_key = DecodingKey::from_rsa_pem(public_key_pem.as_bytes())
-            .map_err(|e| AuthError::InvalidPublicKey(format!("Invalid JWT public key: {}", e)))?;
-
-        // validate token
-        let token_data = decode::<JwtClaims>(token, &decoding_key, &validation)
-            .map_err(|e| AuthError::ValidationFailed(format!("JWT validation failed: {}", e)))?;
-
-        Ok(token_data.claims.into())
     }
 }
 
@@ -149,14 +207,19 @@ mod tests {
         }
     }
 
-    fn generate_jwt_token(private_key_pem: &str, claims: JwtClaims) -> String {
+    fn generate_jwt_token_rs256(private_key_pem: &str, claims: JwtClaims) -> String {
         let header = Header::new(Algorithm::RS256);
         let private_key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
             .expect("failed to load private key for signing");
         encode(&header, &claims, &private_key).expect("failed to encode JWT")
     }
 
-    fn setup_test_env(public_key: &str) {
+    fn generate_jwt_token_hs512(secret: &[u8], claims: JwtClaims) -> String {
+        let header = Header::new(Algorithm::HS512);
+        encode(&header, &claims, &EncodingKey::from_secret(secret)).expect("failed to encode JWT")
+    }
+
+    fn setup_test_env_rs256(public_key: &str) {
         unsafe {
             std::env::set_var("JWT_ISSUER", "Joken");
             std::env::set_var("JWT_AUDIENCE", "Joken");
@@ -164,13 +227,23 @@ mod tests {
         }
     }
 
+    fn setup_test_env_hs512(secret: &str) {
+        unsafe {
+            std::env::set_var("JWT_ISSUER", "Joken");
+            std::env::set_var("JWT_AUDIENCE", "Joken");
+            std::env::set_var("JWT_SECRET", secret);
+        }
+    }
+
+    // Tests for RS256
+
     #[test]
-    fn test_valid_jwt_with_valid_signature() {
+    fn test_rs256_valid_jwt_with_valid_signature() {
         let (private_key, public_key) = generate_rsa_key_pair();
-        setup_test_env(&public_key);
+        setup_test_env_rs256(&public_key);
 
         let claims = generate_claims(3600);
-        let token = generate_jwt_token(&private_key, claims);
+        let token = generate_jwt_token_rs256(&private_key, claims);
 
         let headers = vec![("Authorization".to_string(), format!("Bearer {}", token))];
         let result = Component::validate_token(headers);
@@ -182,13 +255,13 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_jwt_with_invalid_signature() {
+    fn test_rs256_valid_jwt_with_invalid_signature() {
         let (private_key1, _) = generate_rsa_key_pair();
         let (_, public_key2) = generate_rsa_key_pair();
-        setup_test_env(&public_key2);
+        setup_test_env_rs256(&public_key2);
 
         let claims = generate_claims(3600);
-        let token = generate_jwt_token(&private_key1, claims);
+        let token = generate_jwt_token_rs256(&private_key1, claims);
 
         let headers = vec![("Authorization".to_string(), format!("Bearer {}", token))];
         let result = Component::validate_token(headers);
@@ -197,23 +270,73 @@ mod tests {
     }
 
     #[test]
-    fn test_expired_jwt_token() {
+    fn test_rs256_expired_jwt_token() {
         let (private_key, public_key) = generate_rsa_key_pair();
-        setup_test_env(&public_key);
+        setup_test_env_rs256(&public_key);
 
         let claims = generate_claims(-3600);
-        let token = generate_jwt_token(&private_key, claims);
+        let token = generate_jwt_token_rs256(&private_key, claims);
 
         let headers = vec![("Authorization".to_string(), format!("Bearer {}", token))];
         let result = Component::validate_token(headers);
 
         assert!(matches!(result, Err(AuthError::ValidationFailed(_))));
     }
+
+    // Tests for HS512
+
+    #[test]
+    fn test_hs512_valid_jwt_with_valid_secret() {
+        let secret = "super_secret_key_for_hs512_testing_purposes";
+        setup_test_env_hs512(secret);
+
+        let claims = generate_claims(3600);
+        let token = generate_jwt_token_hs512(secret.as_bytes(), claims);
+
+        let headers = vec![("Authorization".to_string(), format!("Bearer {}", token))];
+        let result = Component::validate_token(headers);
+
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        let validated_claims = result.unwrap();
+        assert_eq!(validated_claims.aud, "Joken");
+        assert_eq!(validated_claims.user_id, 1);
+    }
+
+    #[test]
+    fn test_hs512_valid_jwt_with_invalid_secret() {
+        let secret1 = "correct_secret_key";
+        let secret2 = "wrong_secret_key";
+        setup_test_env_hs512(secret2);
+
+        let claims = generate_claims(3600);
+        let token = generate_jwt_token_hs512(secret1.as_bytes(), claims);
+
+        let headers = vec![("Authorization".to_string(), format!("Bearer {}", token))];
+        let result = Component::validate_token(headers);
+
+        assert!(matches!(result, Err(AuthError::ValidationFailed(_))));
+    }
+
+    #[test]
+    fn test_hs512_expired_jwt_token() {
+        let secret = "super_secret_key_for_hs512_testing_purposes";
+        setup_test_env_hs512(secret);
+
+        let claims = generate_claims(-3600);
+        let token = generate_jwt_token_hs512(secret.as_bytes(), claims);
+
+        let headers = vec![("Authorization".to_string(), format!("Bearer {}", token))];
+        let result = Component::validate_token(headers);
+
+        assert!(matches!(result, Err(AuthError::ValidationFailed(_))));
+    }
+
+    // Common Tests
 
     #[test]
     fn test_malformed_jwt() {
         let (_, public_key) = generate_rsa_key_pair();
-        setup_test_env(&public_key);
+        setup_test_env_rs256(&public_key);
 
         let headers = vec![(
             "Authorization".to_string(),
@@ -227,7 +350,7 @@ mod tests {
     #[test]
     fn test_null_jwt_token() {
         let (_, public_key) = generate_rsa_key_pair();
-        setup_test_env(&public_key);
+        setup_test_env_rs256(&public_key);
 
         let headers = vec![("Authorization".to_string(), "Bearer null".to_string())];
         let result = Component::validate_token(headers);
@@ -238,7 +361,7 @@ mod tests {
     #[test]
     fn test_missing_authorization_header() {
         let (_, public_key) = generate_rsa_key_pair();
-        setup_test_env(&public_key);
+        setup_test_env_rs256(&public_key);
 
         let headers = vec![];
         let result = Component::validate_token(headers);
@@ -249,9 +372,9 @@ mod tests {
     #[test]
     fn test_unsupported_algorithm() {
         let (_, public_key) = generate_rsa_key_pair();
-        setup_test_env(&public_key);
+        setup_test_env_rs256(&public_key);
 
-        // Create a token with HS256 algorithm (unsupported)
+        // Create a token with HS256 algorithm (unsupported - only RS256 and HS512 are allowed)
         let claims = generate_claims(3600);
         let secret = b"secret";
         let header = Header::new(Algorithm::HS256);

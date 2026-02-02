@@ -1,4 +1,4 @@
-package wasmcloud:hello;
+package betty-blocks:auth-implementer;
 
 world hello {
    export betty-blocks:auth/jwt;

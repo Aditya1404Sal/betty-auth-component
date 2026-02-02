@@ -28,5 +28,5 @@ interface jwt {
 
     type auth-headers = list<tuple<string, string>>;
 
-    validate-token: func(headers: auth-headers ) -> result<claims, auth-error>;
+    validate-token: func(headers: auth-headers) -> result<claims, auth-error>;
 }
