@@ -1,0 +1,5 @@
+package wasmcloud:hello;
+
+world hello {
+   export betty-blocks:auth/jwt;
+}
